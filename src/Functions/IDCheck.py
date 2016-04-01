@@ -1,3 +1,12 @@
+'''
+Created on Mar 31, 2016
+excise 6_2 :修改例6-1的idcheck.py脚本，使之可以检测长度为一的标示符，并且可以识别关键字。
+Python Version : Python 3.3.4
+@author: RandyGuo
+Date: 2016-03-31
+'''
+# this is a function to solve identify the id
+
 import keyword
 import string
 
