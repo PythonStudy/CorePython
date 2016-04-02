@@ -1,3 +1,6 @@
+"""
+    Give a number of strings , find the longest string and return it.
+"""
 #coding='utf-8'
 '''
 Created on 2016-04-02
