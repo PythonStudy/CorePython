@@ -1,622 +1,1254 @@
-'''
-Created on 2016Äê4ÔÂ1ÈÕ
+"""Configuration file parser.
 
-@author: RandyGuo
-'''
-_SCHEME_KEYS = ('stdlib', 'platstdlib', 'purelib', 'platlib', 'include',
-                'scripts', 'data')
+A configuration file consists of sections, lead by a "[section]" header,
+and followed by "name: value" entries, with continuations and such in
+the style of RFC 822.
 
- # FIXME don't rely on sys.version here, its format is an implementation detail
- # of CPython, use sys.version_info or sys.hexversion
-_PY_VERSION = sys.version.split()[0]
-_PY_VERSION_SHORT = sys.version[:3]
-_PY_VERSION_SHORT_NO_DOT = _PY_VERSION[0] + _PY_VERSION[2]
-_PREFIX = os.path.normpath(sys.prefix)
-_BASE_PREFIX = os.path.normpath(sys.base_prefix)
-_EXEC_PREFIX = os.path.normpath(sys.exec_prefix)
-_BASE_EXEC_PREFIX = os.path.normpath(sys.base_exec_prefix)
-_CONFIG_VARS = None
-_USER_BASE = None
+Intrinsic defaults can be specified by passing them into the
+ConfigParser constructor as a dictionary.
+
+class:
+
+ConfigParser -- responsible for parsing a list of
+                    configuration files, and managing the parsed database.
+
+    methods:
+
+    __init__(defaults=None, dict_type=_default_dict, allow_no_value=False,
+             delimiters=('=', ':'), comment_prefixes=('#', ';'),
+             inline_comment_prefixes=None, strict=True,
+             empty_lines_in_values=True):
+        Create the parser. When `defaults' is given, it is initialized into the
+        dictionary or intrinsic defaults. The keys must be strings, the values
+        must be appropriate for %()s string interpolation.
+
+        When `dict_type' is given, it will be used to create the dictionary
+        objects for the list of sections, for the options within a section, and
+        for the default values.
+
+        When `delimiters' is given, it will be used as the set of substrings
+        that divide keys from values.
+
+        When `comment_prefixes' is given, it will be used as the set of
+        substrings that prefix comments in empty lines. Comments can be
+        indented.
+
+        When `inline_comment_prefixes' is given, it will be used as the set of
+        substrings that prefix comments in non-empty lines.
+
+        When `strict` is True, the parser won't allow for any section or option
+        duplicates while reading from a single source (file, string or
+        dictionary). Default is True.
+
+        When `empty_lines_in_values' is False (default: True), each empty line
+        marks the end of an option. Otherwise, internal empty lines of
+        a multiline option are kept as part of the value.
+
+        When `allow_no_value' is True (default: False), options without
+        values are accepted; the value presented for these is None.
+
+    sections()
+        Return all the configuration section names, sans DEFAULT.
+
+    has_section(section)
+        Return whether the given section exists.
+
+    has_option(section, option)
+        Return whether the given option exists in the given section.
+
+    options(section)
+        Return list of configuration options for the named section.
+
+    read(filenames, encoding=None)
+        Read and parse the list of named configuration files, given by
+        name.  A single filename is also allowed.  Non-existing files
+        are ignored.  Return list of successfully read files.
+
+    read_file(f, filename=None)
+        Read and parse one configuration file, given as a file object.
+        The filename defaults to f.name; it is only used in error
+        messages (if f has no `name' attribute, the string `<???>' is used).
+
+    read_string(string)
+        Read configuration from a given string.
+
+    read_dict(dictionary)
+        Read configuration from a dictionary. Keys are section names,
+        values are dictionaries with keys and values that should be present
+        in the section. If the used dictionary type preserves order, sections
+        and their keys will be added in order. Values are automatically
+        converted to strings.
+
+    get(section, option, raw=False, vars=None, fallback=_UNSET)
+        Return a string value for the named option.  All % interpolations are
+        expanded in the return values, based on the defaults passed into the
+        constructor and the DEFAULT section.  Additional substitutions may be
+        provided using the `vars' argument, which must be a dictionary whose
+        contents override any pre-existing defaults. If `option' is a key in
+        `vars', the value from `vars' is used.
+
+    getint(section, options, raw=False, vars=None, fallback=_UNSET)
+        Like get(), but convert value to an integer.
+
+    getfloat(section, options, raw=False, vars=None, fallback=_UNSET)
+        Like get(), but convert value to a float.
+
+    getboolean(section, options, raw=False, vars=None, fallback=_UNSET)
+        Like get(), but convert value to a boolean (currently case
+        insensitively defined as 0, false, no, off for False, and 1, true,
+        yes, on for True).  Returns False or True.
+
+    items(section=_UNSET, raw=False, vars=None)
+        If section is given, return a list of tuples with (name, value) for
+        each option in the section. Otherwise, return a list of tuples with
+        (section_name, section_proxy) for each section, including DEFAULTSECT.
+
+    remove_section(section)
+        Remove the given file section and all its options.
+
+    remove_option(section, option)
+        Remove the given option from the given section.
+
+    set(section, option, value)
+        Set the given option.
+
+    write(fp, space_around_delimiters=True)
+        Write the configuration state in .ini format. If
+        `space_around_delimiters' is True (the default), delimiters
+        between keys and values are surrounded by spaces.
+"""
+
+from collections.abc import MutableMapping
+from collections import OrderedDict as _default_dict, ChainMap as _ChainMap
+import functools
+import io
+import itertools
+import re
+import sys
+import warnings
+
+__all__ = ["NoSectionError", "DuplicateOptionError", "DuplicateSectionError",
+           "NoOptionError", "InterpolationError", "InterpolationDepthError",
+           "InterpolationSyntaxError", "ParsingError",
+           "MissingSectionHeaderError",
+           "ConfigParser", "SafeConfigParser", "RawConfigParser",
+           "DEFAULTSECT", "MAX_INTERPOLATION_DEPTH"]
+
+DEFAULTSECT = "DEFAULT"
+
+MAX_INTERPOLATION_DEPTH = 10
 
 
-def _safe_realpath(path):
-    try:
-        return realpath(path)
-    except OSError:
-        return path
 
-if sys.executable:
-    _PROJECT_BASE = os.path.dirname(_safe_realpath(sys.executable))
-else:
-    # sys.executable can be empty if argv[0] has been changed and Python is
-    # unable to retrieve the real program name
-    _PROJECT_BASE = _safe_realpath(os.getcwd())
+# exception classes
+class Error(Exception):
+    """Base class for ConfigParser exceptions."""
 
-if os.name == "nt" and "pcbuild" in _PROJECT_BASE[-8:].lower():
-    _PROJECT_BASE = _safe_realpath(os.path.join(_PROJECT_BASE, pardir))
-# PC/VS7.1
-if os.name == "nt" and "\\pc\\v" in _PROJECT_BASE[-10:].lower():
-    _PROJECT_BASE = _safe_realpath(os.path.join(_PROJECT_BASE, pardir, pardir))
-# PC/AMD64
-if os.name == "nt" and "\\pcbuild\\amd64" in _PROJECT_BASE[-14:].lower():
-    _PROJECT_BASE = _safe_realpath(os.path.join(_PROJECT_BASE, pardir, pardir))
+    def __init__(self, msg=''):
+        self.message = msg
+        Exception.__init__(self, msg)
 
-# set for cross builds
-if "_PYTHON_PROJECT_BASE" in os.environ:
-    _PROJECT_BASE = _safe_realpath(os.environ["_PYTHON_PROJECT_BASE"])
+    def __repr__(self):
+        return self.message
 
-def _is_python_source_dir(d):
-    for fn in ("Setup.dist", "Setup.local"):
-        if os.path.isfile(os.path.join(d, "Modules", fn)):
-            return True
-    return False
-
-_sys_home = getattr(sys, '_home', None)
-if _sys_home and os.name == 'nt' and \
-    _sys_home.lower().endswith(('pcbuild', 'pcbuild\\amd64')):
-    _sys_home = os.path.dirname(_sys_home)
-    if _sys_home.endswith('pcbuild'):   # must be amd64
-        _sys_home = os.path.dirname(_sys_home)
-def is_python_build(check_home=False):
-    if check_home and _sys_home:
-        return _is_python_source_dir(_sys_home)
-    return _is_python_source_dir(_PROJECT_BASE)
-
-_PYTHON_BUILD = is_python_build(True)
-
-if _PYTHON_BUILD:
-    for scheme in ('posix_prefix', 'posix_home'):
-        _INSTALL_SCHEMES[scheme]['include'] = '{srcdir}/Include'
-        _INSTALL_SCHEMES[scheme]['platinclude'] = '{projectbase}/.'
+    __str__ = __repr__
 
 
-def _subst_vars(s, local_vars):
-    try:
-        return s.format(**local_vars)
-    except KeyError:
-        try:
-            return s.format(**os.environ)
-        except KeyError as var:
-            raise AttributeError('{%s}' % var)
+class NoSectionError(Error):
+    """Raised when no section matches a requested option."""
 
-def _extend_dict(target_dict, other_dict):
-    target_keys = target_dict.keys()
-    for key, value in other_dict.items():
-        if key in target_keys:
-            continue
-        target_dict[key] = value
+    def __init__(self, section):
+        Error.__init__(self, 'No section: %r' % (section,))
+        self.section = section
+        self.args = (section, )
 
 
-def _expand_vars(scheme, vars):
-    res = {}
-    if vars is None:
-        vars = {}
-    _extend_dict(vars, get_config_vars())
+class DuplicateSectionError(Error):
+    """Raised when a section is repeated in an input source.
 
-    for key, value in _INSTALL_SCHEMES[scheme].items():
-        if os.name in ('posix', 'nt'):
-            value = os.path.expanduser(value)
-        res[key] = os.path.normpath(_subst_vars(value, vars))
-    return res
-
-
-def _get_default_scheme():
-    if os.name == 'posix':
-        # the default scheme for posix is posix_prefix
-        return 'posix_prefix'
-    return os.name
-
-
-def _getuserbase():
-    env_base = os.environ.get("PYTHONUSERBASE", None)
-
-    def joinuser(*args):
-        return os.path.expanduser(os.path.join(*args))
-
-    # what about 'os2emx', 'riscos' ?
-    if os.name == "nt":
-        base = os.environ.get("APPDATA") or "~"
-        if env_base:
-            return env_base
-        else:
-            return joinuser(base, "Python")
-
-    if sys.platform == "darwin":
-        framework = get_config_var("PYTHONFRAMEWORK")
-        if framework:
-            if env_base:
-                return env_base
-            else:
-                return joinuser("~", "Library", framework, "%d.%d" %
-                                sys.version_info[:2])
-
-    if env_base:
-        return env_base
-    else:
-        return joinuser("~", ".local")
-
-
-def _parse_makefile(filename, vars=None):
-    """Parse a Makefile-style file.
-
-    A dictionary containing name/value pairs is returned.  If an
-    optional dictionary is passed in as the second argument, it is
-    used instead of a new dictionary.
+    Possible repetitions that raise this exception are: multiple creation
+    using the API or in strict parsers when a section is found more than once
+    in a single input file, string or dictionary.
     """
-    # Regexes needed for parsing Makefile (and similar syntaxes,
-    # like old-style Setup files).
-    _variable_rx = re.compile("([a-zA-Z][a-zA-Z0-9_]+)\s*=\s*(.*)")
-    _findvar1_rx = re.compile(r"\$\(([A-Za-z][A-Za-z0-9_]*)\)")
-    _findvar2_rx = re.compile(r"\${([A-Za-z][A-Za-z0-9_]*)}")
 
-    if vars is None:
-        vars = {}
-    done = {}
-    notdone = {}
+    def __init__(self, section, source=None, lineno=None):
+        msg = [repr(section), " already exists"]
+        if source is not None:
+            message = ["While reading from ", repr(source)]
+            if lineno is not None:
+                message.append(" [line {0:2d}]".format(lineno))
+            message.append(": section ")
+            message.extend(msg)
+            msg = message
+        else:
+            msg.insert(0, "Section ")
+        Error.__init__(self, "".join(msg))
+        self.section = section
+        self.source = source
+        self.lineno = lineno
+        self.args = (section, source, lineno)
 
-    with open(filename, errors="surrogateescape") as f:
-        lines = f.readlines()
 
-    for line in lines:
-        if line.startswith('#') or line.strip() == '':
-            continue
-        m = _variable_rx.match(line)
-        if m:
-            n, v = m.group(1, 2)
-            v = v.strip()
-            # `$$' is a literal `$' in make
-            tmpv = v.replace('$$', '')
+class DuplicateOptionError(Error):
+    """Raised by strict parsers when an option is repeated in an input source.
 
-            if "$" in tmpv:
-                notdone[n] = v
-            else:
+    Current implementation raises this exception only when an option is found
+    more than once in a single file, string or dictionary.
+    """
+
+    def __init__(self, section, option, source=None, lineno=None):
+        msg = [repr(option), " in section ", repr(section),
+               " already exists"]
+        if source is not None:
+            message = ["While reading from ", repr(source)]
+            if lineno is not None:
+                message.append(" [line {0:2d}]".format(lineno))
+            message.append(": option ")
+            message.extend(msg)
+            msg = message
+        else:
+            msg.insert(0, "Option ")
+        Error.__init__(self, "".join(msg))
+        self.section = section
+        self.option = option
+        self.source = source
+        self.lineno = lineno
+        self.args = (section, option, source, lineno)
+
+
+class NoOptionError(Error):
+    """A requested option was not found."""
+
+    def __init__(self, option, section):
+        Error.__init__(self, "No option %r in section: %r" %
+                       (option, section))
+        self.option = option
+        self.section = section
+        self.args = (option, section)
+
+
+class InterpolationError(Error):
+    """Base class for interpolation-related exceptions."""
+
+    def __init__(self, option, section, msg):
+        Error.__init__(self, msg)
+        self.option = option
+        self.section = section
+        self.args = (option, section, msg)
+
+
+class InterpolationMissingOptionError(InterpolationError):
+    """A string substitution required a setting which was not available."""
+
+    def __init__(self, option, section, rawval, reference):
+        msg = ("Bad value substitution:\n"
+               "\tsection: [%s]\n"
+               "\toption : %s\n"
+               "\tkey    : %s\n"
+               "\trawval : %s\n"
+               % (section, option, reference, rawval))
+        InterpolationError.__init__(self, option, section, msg)
+        self.reference = reference
+        self.args = (option, section, rawval, reference)
+
+
+class InterpolationSyntaxError(InterpolationError):
+    """Raised when the source text contains invalid syntax.
+
+    Current implementation raises this exception when the source text into
+    which substitutions are made does not conform to the required syntax.
+    """
+
+
+class InterpolationDepthError(InterpolationError):
+    """Raised when substitutions are nested too deeply."""
+
+    def __init__(self, option, section, rawval):
+        msg = ("Value interpolation too deeply recursive:\n"
+               "\tsection: [%s]\n"
+               "\toption : %s\n"
+               "\trawval : %s\n"
+               % (section, option, rawval))
+        InterpolationError.__init__(self, option, section, msg)
+        self.args = (option, section, rawval)
+
+
+class ParsingError(Error):
+    """Raised when a configuration file does not follow legal syntax."""
+
+    def __init__(self, source=None, filename=None):
+        # Exactly one of `source'/`filename' arguments has to be given.
+        # `filename' kept for compatibility.
+        if filename and source:
+            raise ValueError("Cannot specify both `filename' and `source'. "
+                             "Use `source'.")
+        elif not filename and not source:
+            raise ValueError("Required argument `source' not given.")
+        elif filename:
+            source = filename
+        Error.__init__(self, 'Source contains parsing errors: %s' % source)
+        self.source = source
+        self.errors = []
+        self.args = (source, )
+
+    @property
+    def filename(self):
+        """Deprecated, use `source'."""
+        warnings.warn(
+            "The 'filename' attribute will be removed in future versions.  "
+            "Use 'source' instead.",
+            DeprecationWarning, stacklevel=2
+        )
+        return self.source
+
+    @filename.setter
+    def filename(self, value):
+        """Deprecated, user `source'."""
+        warnings.warn(
+            "The 'filename' attribute will be removed in future versions.  "
+            "Use 'source' instead.",
+            DeprecationWarning, stacklevel=2
+        )
+        self.source = value
+
+    def append(self, lineno, line):
+        self.errors.append((lineno, line))
+        self.message += '\n\t[line %2d]: %s' % (lineno, line)
+
+
+class MissingSectionHeaderError(ParsingError):
+    """Raised when a key-value pair is found before any section header."""
+
+    def __init__(self, filename, lineno, line):
+        Error.__init__(
+            self,
+            'File contains no section headers.\nfile: %s, line: %d\n%r' %
+            (filename, lineno, line))
+        self.source = filename
+        self.lineno = lineno
+        self.line = line
+        self.args = (filename, lineno, line)
+
+
+# Used in parser getters to indicate the default behaviour when a specific
+# option is not found it to raise an exception. Created to enable `None' as
+# a valid fallback value.
+_UNSET = object()
+
+
+class Interpolation:
+    """Dummy interpolation that passes the value through with no changes."""
+
+    def before_get(self, parser, section, option, value, defaults):
+        return value
+
+    def before_set(self, parser, section, option, value):
+        return value
+
+    def before_read(self, parser, section, option, value):
+        return value
+
+    def before_write(self, parser, section, option, value):
+        return value
+
+
+class BasicInterpolation(Interpolation):
+    """Interpolation as implemented in the classic ConfigParser.
+
+    The option values can contain format strings which refer to other values in
+    the same section, or values in the special default section.
+
+    For example:
+
+        something: %(dir)s/whatever
+
+    would resolve the "%(dir)s" to the value of dir.  All reference
+    expansions are done late, on demand. If a user needs to use a bare % in
+    a configuration file, she can escape it by writing %%. Other % usage
+    is considered a user error and raises `InterpolationSyntaxError'."""
+
+    _KEYCRE = re.compile(r"%\(([^)]+)\)s")
+
+    def before_get(self, parser, section, option, value, defaults):
+        L = []
+        self._interpolate_some(parser, option, L, value, section, defaults, 1)
+        return ''.join(L)
+
+    def before_set(self, parser, section, option, value):
+        tmp_value = value.replace('%%', '') # escaped percent signs
+        tmp_value = self._KEYCRE.sub('', tmp_value) # valid syntax
+        if '%' in tmp_value:
+            raise ValueError("invalid interpolation syntax in %r at "
+                             "position %d" % (value, tmp_value.find('%')))
+        return value
+
+    def _interpolate_some(self, parser, option, accum, rest, section, map,
+                          depth):
+        if depth > MAX_INTERPOLATION_DEPTH:
+            raise InterpolationDepthError(option, section, rest)
+        while rest:
+            p = rest.find("%")
+            if p < 0:
+                accum.append(rest)
+                return
+            if p > 0:
+                accum.append(rest[:p])
+                rest = rest[p:]
+            # p is no longer used
+            c = rest[1:2]
+            if c == "%":
+                accum.append("%")
+                rest = rest[2:]
+            elif c == "(":
+                m = self._KEYCRE.match(rest)
+                if m is None:
+                    raise InterpolationSyntaxError(option, section,
+                        "bad interpolation variable reference %r" % rest)
+                var = parser.optionxform(m.group(1))
+                rest = rest[m.end():]
                 try:
-                    v = int(v)
-                except ValueError:
-                    # insert literal `$'
-                    done[n] = v.replace('$$', '$')
+                    v = map[var]
+                except KeyError:
+                    raise InterpolationMissingOptionError(
+                        option, section, rest, var)
+                if "%" in v:
+                    self._interpolate_some(parser, option, accum, v,
+                                           section, map, depth + 1)
                 else:
-                    done[n] = v
-
-    # do variable interpolation here
-    variables = list(notdone.keys())
-
-    # Variables with a 'PY_' prefix in the makefile. These need to
-    # be made available without that prefix through sysconfig.
-    # Special care is needed to ensure that variable expansion works, even
-    # if the expansion uses the name without a prefix.
-    renamed_variables = ('CFLAGS', 'LDFLAGS', 'CPPFLAGS')
-
-    while len(variables) > 0:
-        for name in tuple(variables):
-            value = notdone[name]
-            m = _findvar1_rx.search(value) or _findvar2_rx.search(value)
-            if m is not None:
-                n = m.group(1)
-                found = True
-                if n in done:
-                    item = str(done[n])
-                elif n in notdone:
-                    # get it on a subsequent round
-                    found = False
-                elif n in os.environ:
-                    # do it like make: fall back to environment
-                    item = os.environ[n]
-
-                elif n in renamed_variables:
-                    if (name.startswith('PY_') and
-                        name[3:] in renamed_variables):
-                        item = ""
-
-                    elif 'PY_' + n in notdone:
-                        found = False
-
-                    else:
-                        item = str(done['PY_' + n])
-
-                else:
-                    done[n] = item = ""
-
-                if found:
-                    after = value[m.end():]
-                    value = value[:m.start()] + item + after
-                    if "$" in after:
-                        notdone[name] = value
-                    else:
-                        try:
-                            value = int(value)
-                        except ValueError:
-                            done[name] = value.strip()
-                        else:
-                            done[name] = value
-                        variables.remove(name)
-
-                        if name.startswith('PY_') \
-                        and name[3:] in renamed_variables:
-
-                            name = name[3:]
-                            if name not in done:
-                                done[name] = value
-
+                    accum.append(v)
             else:
-                # bogus variable reference (e.g. "prefix=$/opt/python");
-                # just drop it since we can't deal
-                done[name] = value
-                variables.remove(name)
-
-    # strip spurious spaces
-    for k, v in done.items():
-        if isinstance(v, str):
-            done[k] = v.strip()
-
-    # save the results in the global dictionary
-    vars.update(done)
-    return vars
+                raise InterpolationSyntaxError(
+                    option, section,
+                    "'%%' must be followed by '%%' or '(', "
+                    "found: %r" % (rest,))
 
 
-def get_makefile_filename():
-    """Return the path of the Makefile."""
-    if _PYTHON_BUILD:
-        return os.path.join(_sys_home or _PROJECT_BASE, "Makefile")
-    if hasattr(sys, 'abiflags'):
-        config_dir_name = 'config-%s%s' % (_PY_VERSION_SHORT, sys.abiflags)
-    else:
-        config_dir_name = 'config'
-    return os.path.join(get_path('stdlib'), config_dir_name, 'Makefile')
+class ExtendedInterpolation(Interpolation):
+    """Advanced variant of interpolation, supports the syntax used by
+    `zc.buildout'. Enables interpolation between sections."""
 
-def _generate_posix_vars():
-    """Generate the Python module containing build-time variables."""
-    import pprint
-    vars = {}
-    # load the installed Makefile:
-    makefile = get_makefile_filename()
-    try:
-        _parse_makefile(makefile, vars)
-    except IOError as e:
-        msg = "invalid Python installation: unable to open %s" % makefile
-        if hasattr(e, "strerror"):
-            msg = msg + " (%s)" % e.strerror
-        raise IOError(msg)
-    # load the installed pyconfig.h:
-    config_h = get_config_h_filename()
-    try:
-        with open(config_h) as f:
-            parse_config_h(f, vars)
-    except IOError as e:
-        msg = "invalid Python installation: unable to open %s" % config_h
-        if hasattr(e, "strerror"):
-            msg = msg + " (%s)" % e.strerror
-        raise IOError(msg)
-    # On AIX, there are wrong paths to the linker scripts in the Makefile
-    # -- these paths are relative to the Python source, but when installed
-    # the scripts are in another directory.
-    if _PYTHON_BUILD:
-        vars['BLDSHARED'] = vars['LDSHARED']
+    _KEYCRE = re.compile(r"\$\{([^}]+)\}")
 
-    # There's a chicken-and-egg situation on OS X with regards to the
-    # _sysconfigdata module after the changes introduced by #15298:
-    # get_config_vars() is called by get_platform() as part of the
-    # `make pybuilddir.txt` target -- which is a precursor to the
-    # _sysconfigdata.py module being constructed.  Unfortunately,
-    # get_config_vars() eventually calls _init_posix(), which attempts
-    # to import _sysconfigdata, which we won't have built yet.  In order
-    # for _init_posix() to work, if we're on Darwin, just mock up the
-    # _sysconfigdata module manually and populate it with the build vars.
-    # This is more than sufficient for ensuring the subsequent call to
-    # get_platform() succeeds.
-    name = '_sysconfigdata'
-    if 'darwin' in sys.platform:
-        import imp
-        module = imp.new_module(name)
-        module.build_time_vars = vars
-        sys.modules[name] = module
+    def before_get(self, parser, section, option, value, defaults):
+        L = []
+        self._interpolate_some(parser, option, L, value, section, defaults, 1)
+        return ''.join(L)
 
-    pybuilddir = 'build/lib.%s-%s' % (get_platform(), sys.version[:3])
-    if hasattr(sys, "gettotalrefcount"):
-        pybuilddir += '-pydebug'
-    os.makedirs(pybuilddir, exist_ok=True)
-    destfile = os.path.join(pybuilddir, name + '.py')
+    def before_set(self, parser, section, option, value):
+        tmp_value = value.replace('$$', '') # escaped dollar signs
+        tmp_value = self._KEYCRE.sub('', tmp_value) # valid syntax
+        if '$' in tmp_value:
+            raise ValueError("invalid interpolation syntax in %r at "
+                             "position %d" % (value, tmp_value.find('$')))
+        return value
 
-    with open(destfile, 'w', encoding='utf8') as f:
-        f.write('# system configuration generated and used by'
-                ' the sysconfig module\n')
-        f.write('build_time_vars = ')
-        pprint.pprint(vars, stream=f)
-
-    # Create file used for sys.path fixup -- see Modules/getpath.c
-    with open('pybuilddir.txt', 'w', encoding='ascii') as f:
-        f.write(pybuilddir)
-
-def _init_posix(vars):
-    """Initialize the module as appropriate for POSIX systems."""
-    # _sysconfigdata is generated at build time, see _generate_posix_vars()
-    from _sysconfigdata import build_time_vars
-    vars.update(build_time_vars)
-
-def _init_non_posix(vars):
-    """Initialize the module as appropriate for NT"""
-    # set basic install directories
-    vars['LIBDEST'] = get_path('stdlib')
-    vars['BINLIBDEST'] = get_path('platstdlib')
-    vars['INCLUDEPY'] = get_path('include')
-    vars['SO'] = '.pyd'
-    vars['EXT_SUFFIX'] = '.pyd'
-    vars['EXE'] = '.exe'
-    vars['VERSION'] = _PY_VERSION_SHORT_NO_DOT
-    vars['BINDIR'] = os.path.dirname(_safe_realpath(sys.executable))
-
-#
-# public APIs
-#
+    def _interpolate_some(self, parser, option, accum, rest, section, map,
+                          depth):
+        if depth > MAX_INTERPOLATION_DEPTH:
+            raise InterpolationDepthError(option, section, rest)
+        while rest:
+            p = rest.find("$")
+            if p < 0:
+                accum.append(rest)
+                return
+            if p > 0:
+                accum.append(rest[:p])
+                rest = rest[p:]
+            # p is no longer used
+            c = rest[1:2]
+            if c == "$":
+                accum.append("$")
+                rest = rest[2:]
+            elif c == "{":
+                m = self._KEYCRE.match(rest)
+                if m is None:
+                    raise InterpolationSyntaxError(option, section,
+                        "bad interpolation variable reference %r" % rest)
+                path = m.group(1).split(':')
+                rest = rest[m.end():]
+                sect = section
+                opt = option
+                try:
+                    if len(path) == 1:
+                        opt = parser.optionxform(path[0])
+                        v = map[opt]
+                    elif len(path) == 2:
+                        sect = path[0]
+                        opt = parser.optionxform(path[1])
+                        v = parser.get(sect, opt, raw=True)
+                    else:
+                        raise InterpolationSyntaxError(
+                            option, section,
+                            "More than one ':' found: %r" % (rest,))
+                except (KeyError, NoSectionError, NoOptionError):
+                    raise InterpolationMissingOptionError(
+                        option, section, rest, ":".join(path))
+                if "$" in v:
+                    self._interpolate_some(parser, opt, accum, v, sect,
+                                           dict(parser.items(sect, raw=True)),
+                                           depth + 1)
+                else:
+                    accum.append(v)
+            else:
+                raise InterpolationSyntaxError(
+                    option, section,
+                    "'$' must be followed by '$' or '{', "
+                    "found: %r" % (rest,))
 
 
-def parse_config_h(fp, vars=None):
-    """Parse a config.h-style file.
+class LegacyInterpolation(Interpolation):
+    """Deprecated interpolation used in old versions of ConfigParser.
+    Use BasicInterpolation or ExtendedInterpolation instead."""
 
-    A dictionary containing name/value pairs is returned.  If an
-    optional dictionary is passed in as the second argument, it is
-    used instead of a new dictionary.
-    """
-    if vars is None:
-        vars = {}
-    define_rx = re.compile("#define ([A-Z][A-Za-z0-9_]+) (.*)\n")
-    undef_rx = re.compile("/[*] #undef ([A-Z][A-Za-z0-9_]+) [*]/\n")
+    _KEYCRE = re.compile(r"%\(([^)]*)\)s|.")
 
-    while True:
-        line = fp.readline()
-        if not line:
-            break
-        m = define_rx.match(line)
-        if m:
-            n, v = m.group(1, 2)
-            try:
-                v = int(v)
-            except ValueError:
-                pass
-            vars[n] = v
+    def before_get(self, parser, section, option, value, vars):
+        rawval = value
+        depth = MAX_INTERPOLATION_DEPTH
+        while depth:                    # Loop through this until it's done
+            depth -= 1
+            if value and "%(" in value:
+                replace = functools.partial(self._interpolation_replace,
+                                            parser=parser)
+                value = self._KEYCRE.sub(replace, value)
+                try:
+                    value = value % vars
+                except KeyError as e:
+                    raise InterpolationMissingOptionError(
+                        option, section, rawval, e.args[0])
+            else:
+                break
+        if value and "%(" in value:
+            raise InterpolationDepthError(option, section, rawval)
+        return value
+
+    def before_set(self, parser, section, option, value):
+        return value
+
+    @staticmethod
+    def _interpolation_replace(match, parser):
+        s = match.group(1)
+        if s is None:
+            return match.group()
         else:
-            m = undef_rx.match(line)
-            if m:
-                vars[m.group(1)] = 0
-    return vars
+            return "%%(%s)s" % parser.optionxform(s)
 
 
-def get_config_h_filename():
-    """Return the path of pyconfig.h."""
-    if _PYTHON_BUILD:
-        if os.name == "nt":
-            inc_dir = os.path.join(_sys_home or _PROJECT_BASE, "PC")
+class RawConfigParser(MutableMapping):
+    """ConfigParser that does not do interpolation."""
+
+    # Regular expressions for parsing section headers and options
+    _SECT_TMPL = r"""
+        \[                                 # [
+        (?P<header>[^]]+)                  # very permissive!
+        \]                                 # ]
+        """
+    _OPT_TMPL = r"""
+        (?P<option>.*?)                    # very permissive!
+        \s*(?P<vi>{delim})\s*              # any number of space/tab,
+                                           # followed by any of the
+                                           # allowed delimiters,
+                                           # followed by any space/tab
+        (?P<value>.*)$                     # everything up to eol
+        """
+    _OPT_NV_TMPL = r"""
+        (?P<option>.*?)                    # very permissive!
+        \s*(?:                             # any number of space/tab,
+        (?P<vi>{delim})\s*                 # optionally followed by
+                                           # any of the allowed
+                                           # delimiters, followed by any
+                                           # space/tab
+        (?P<value>.*))?$                   # everything up to eol
+        """
+    # Interpolation algorithm to be used if the user does not specify another
+    _DEFAULT_INTERPOLATION = Interpolation()
+    # Compiled regular expression for matching sections
+    SECTCRE = re.compile(_SECT_TMPL, re.VERBOSE)
+    # Compiled regular expression for matching options with typical separators
+    OPTCRE = re.compile(_OPT_TMPL.format(delim="=|:"), re.VERBOSE)
+    # Compiled regular expression for matching options with optional values
+    # delimited using typical separators
+    OPTCRE_NV = re.compile(_OPT_NV_TMPL.format(delim="=|:"), re.VERBOSE)
+    # Compiled regular expression for matching leading whitespace in a line
+    NONSPACECRE = re.compile(r"\S")
+    # Possible boolean values in the configuration.
+    BOOLEAN_STATES = {'1': True, 'yes': True, 'true': True, 'on': True,
+                      '0': False, 'no': False, 'false': False, 'off': False}
+
+    def __init__(self, defaults=None, dict_type=_default_dict,
+                 allow_no_value=False, *, delimiters=('=', ':'),
+                 comment_prefixes=('#', ';'), inline_comment_prefixes=None,
+                 strict=True, empty_lines_in_values=True,
+                 default_section=DEFAULTSECT,
+                 interpolation=_UNSET):
+
+        self._dict = dict_type
+        self._sections = self._dict()
+        self._defaults = self._dict()
+        self._proxies = self._dict()
+        self._proxies[default_section] = SectionProxy(self, default_section)
+        if defaults:
+            for key, value in defaults.items():
+                self._defaults[self.optionxform(key)] = value
+        self._delimiters = tuple(delimiters)
+        if delimiters == ('=', ':'):
+            self._optcre = self.OPTCRE_NV if allow_no_value else self.OPTCRE
         else:
-            inc_dir = _sys_home or _PROJECT_BASE
-    else:
-        inc_dir = get_path('platinclude')
-    return os.path.join(inc_dir, 'pyconfig.h')
+            d = "|".join(re.escape(d) for d in delimiters)
+            if allow_no_value:
+                self._optcre = re.compile(self._OPT_NV_TMPL.format(delim=d),
+                                          re.VERBOSE)
+            else:
+                self._optcre = re.compile(self._OPT_TMPL.format(delim=d),
+                                          re.VERBOSE)
+        self._comment_prefixes = tuple(comment_prefixes or ())
+        self._inline_comment_prefixes = tuple(inline_comment_prefixes or ())
+        self._strict = strict
+        self._allow_no_value = allow_no_value
+        self._empty_lines_in_values = empty_lines_in_values
+        self.default_section=default_section
+        self._interpolation = interpolation
+        if self._interpolation is _UNSET:
+            self._interpolation = self._DEFAULT_INTERPOLATION
+        if self._interpolation is None:
+            self._interpolation = Interpolation()
 
+    def defaults(self):
+        return self._defaults
 
-def get_scheme_names():
-    """Return a tuple containing the schemes names."""
-    return tuple(sorted(_INSTALL_SCHEMES))
+    def sections(self):
+        """Return a list of section names, excluding [DEFAULT]"""
+        # self._sections will never have [DEFAULT] in it
+        return list(self._sections.keys())
 
+    def add_section(self, section):
+        """Create a new section in the configuration.
 
-def get_path_names():
-    """Return a tuple containing the paths names."""
-    return _SCHEME_KEYS
+        Raise DuplicateSectionError if a section by the specified name
+        already exists. Raise ValueError if name is DEFAULT.
+        """
+        if section == self.default_section:
+            raise ValueError('Invalid section name: %r' % section)
 
+        if section in self._sections:
+            raise DuplicateSectionError(section)
+        self._sections[section] = self._dict()
+        self._proxies[section] = SectionProxy(self, section)
 
-def get_paths(scheme=_get_default_scheme(), vars=None, expand=True):
-    """Return a mapping containing an install scheme.
+    def has_section(self, section):
+        """Indicate whether the named section is present in the configuration.
 
-    ``scheme`` is the install scheme name. If not provided, it will
-    return the default scheme for the current platform.
-    """
-    if expand:
-        return _expand_vars(scheme, vars)
-    else:
-        return _INSTALL_SCHEMES[scheme]
+        The DEFAULT section is not acknowledged.
+        """
+        return section in self._sections
 
-
-def get_path(name, scheme=_get_default_scheme(), vars=None, expand=True):
-    """Return a path corresponding to the scheme.
-
-    ``scheme`` is the install scheme name.
-    """
-    return get_paths(scheme, vars, expand)[name]
-
-
-def get_config_vars(*args):
-    """With no arguments, return a dictionary of all configuration
-    variables relevant for the current platform.
-
-    On Unix, this means every variable defined in Python's installed Makefile;
-    On Windows it's a much smaller set.
-
-    With arguments, return a list of values that result from looking up
-    each argument in the configuration variable dictionary.
-    """
-    global _CONFIG_VARS
-    if _CONFIG_VARS is None:
-        _CONFIG_VARS = {}
-        # Normalized versions of prefix and exec_prefix are handy to have;
-        # in fact, these are the standard versions used most places in the
-        # Distutils.
-        _CONFIG_VARS['prefix'] = _PREFIX
-        _CONFIG_VARS['exec_prefix'] = _EXEC_PREFIX
-        _CONFIG_VARS['py_version'] = _PY_VERSION
-        _CONFIG_VARS['py_version_short'] = _PY_VERSION_SHORT
-        _CONFIG_VARS['py_version_nodot'] = _PY_VERSION[0] + _PY_VERSION[2]
-        _CONFIG_VARS['installed_base'] = _BASE_PREFIX
-        _CONFIG_VARS['base'] = _PREFIX
-        _CONFIG_VARS['installed_platbase'] = _BASE_EXEC_PREFIX
-        _CONFIG_VARS['platbase'] = _EXEC_PREFIX
-        _CONFIG_VARS['projectbase'] = _PROJECT_BASE
+    def options(self, section):
+        """Return a list of option names for the given section name."""
         try:
-            _CONFIG_VARS['abiflags'] = sys.abiflags
-        except AttributeError:
-            # sys.abiflags may not be defined on all platforms.
-            _CONFIG_VARS['abiflags'] = ''
+            opts = self._sections[section].copy()
+        except KeyError:
+            raise NoSectionError(section)
+        opts.update(self._defaults)
+        return list(opts.keys())
 
-        if os.name in ('nt', 'os2'):
-            _init_non_posix(_CONFIG_VARS)
-        if os.name == 'posix':
-            _init_posix(_CONFIG_VARS)
-        # Setting 'userbase' is done below the call to the
-        # init function to enable using 'get_config_var' in
-        # the init-function.
-        _CONFIG_VARS['userbase'] = _getuserbase()
+    def read(self, filenames, encoding=None):
+        """Read and parse a filename or a list of filenames.
 
-        # Always convert srcdir to an absolute path
-        srcdir = _CONFIG_VARS.get('srcdir', _PROJECT_BASE)
-        if os.name == 'posix':
-            if _PYTHON_BUILD:
-                # If srcdir is a relative path (typically '.' or '..')
-                # then it should be interpreted relative to the directory
-                # containing Makefile.
-                base = os.path.dirname(get_makefile_filename())
-                srcdir = os.path.join(base, srcdir)
+        Files that cannot be opened are silently ignored; this is
+        designed so that you can specify a list of potential
+        configuration file locations (e.g. current directory, user's
+        home directory, systemwide directory), and all existing
+        configuration files in the list will be read.  A single
+        filename may also be given.
+
+        Return list of successfully read files.
+        """
+        if isinstance(filenames, str):
+            filenames = [filenames]
+        read_ok = []
+        for filename in filenames:
+            try:
+                with open(filename, encoding=encoding) as fp:
+                    self._read(fp, filename)
+            except IOError:
+                continue
+            read_ok.append(filename)
+        return read_ok
+
+    def read_file(self, f, source=None):
+        """Like read() but the argument must be a file-like object.
+
+        The `f' argument must be iterable, returning one line at a time.
+        Optional second argument is the `source' specifying the name of the
+        file being read. If not given, it is taken from f.name. If `f' has no
+        `name' attribute, `<???>' is used.
+        """
+        if source is None:
+            try:
+                source = f.name
+            except AttributeError:
+                source = '<???>'
+        self._read(f, source)
+
+    def read_string(self, string, source='<string>'):
+        """Read configuration from a given string."""
+        sfile = io.StringIO(string)
+        self.read_file(sfile, source)
+
+    def read_dict(self, dictionary, source='<dict>'):
+        """Read configuration from a dictionary.
+
+        Keys are section names, values are dictionaries with keys and values
+        that should be present in the section. If the used dictionary type
+        preserves order, sections and their keys will be added in order.
+
+        All types held in the dictionary are converted to strings during
+        reading, including section names, option names and keys.
+
+        Optional second argument is the `source' specifying the name of the
+        dictionary being read.
+        """
+        elements_added = set()
+        for section, keys in dictionary.items():
+            section = str(section)
+            try:
+                self.add_section(section)
+            except (DuplicateSectionError, ValueError):
+                if self._strict and section in elements_added:
+                    raise
+            elements_added.add(section)
+            for key, value in keys.items():
+                key = self.optionxform(str(key))
+                if value is not None:
+                    value = str(value)
+                if self._strict and (section, key) in elements_added:
+                    raise DuplicateOptionError(section, key, source)
+                elements_added.add((section, key))
+                self.set(section, key, value)
+
+    def readfp(self, fp, filename=None):
+        """Deprecated, use read_file instead."""
+        warnings.warn(
+            "This method will be removed in future versions.  "
+            "Use 'parser.read_file()' instead.",
+            DeprecationWarning, stacklevel=2
+        )
+        self.read_file(fp, source=filename)
+
+    def get(self, section, option, *, raw=False, vars=None, fallback=_UNSET):
+        """Get an option value for a given section.
+
+        If `vars' is provided, it must be a dictionary. The option is looked up
+        in `vars' (if provided), `section', and in `DEFAULTSECT' in that order.
+        If the key is not found and `fallback' is provided, it is used as
+        a fallback value. `None' can be provided as a `fallback' value.
+
+        If interpolation is enabled and the optional argument `raw' is False,
+        all interpolations are expanded in the return values.
+
+        Arguments `raw', `vars', and `fallback' are keyword only.
+
+        The section DEFAULT is special.
+        """
+        try:
+            d = self._unify_values(section, vars)
+        except NoSectionError:
+            if fallback is _UNSET:
+                raise
             else:
-                # srcdir is not meaningful since the installation is
-                # spread about the filesystem.  We choose the
-                # directory containing the Makefile since we know it
-                # exists.
-                srcdir = os.path.dirname(get_makefile_filename())
-        _CONFIG_VARS['srcdir'] = _safe_realpath(srcdir)
+                return fallback
+        option = self.optionxform(option)
+        try:
+            value = d[option]
+        except KeyError:
+            if fallback is _UNSET:
+                raise NoOptionError(option, section)
+            else:
+                return fallback
 
-        # OS X platforms require special customization to handle
-        # multi-architecture, multi-os-version installers
-        if sys.platform == 'darwin':
-            import _osx_support
-            _osx_support.customize_config_vars(_CONFIG_VARS)
+        if raw or value is None:
+            return value
+        else:
+            return self._interpolation.before_get(self, section, option, value,
+                                                  d)
 
-    if args:
-        vals = []
-        for name in args:
-            vals.append(_CONFIG_VARS.get(name))
-        return vals
-    else:
-        return _CONFIG_VARS
+    def _get(self, section, conv, option, **kwargs):
+        return conv(self.get(section, option, **kwargs))
+
+    def getint(self, section, option, *, raw=False, vars=None,
+               fallback=_UNSET):
+        try:
+            return self._get(section, int, option, raw=raw, vars=vars)
+        except (NoSectionError, NoOptionError):
+            if fallback is _UNSET:
+                raise
+            else:
+                return fallback
+
+    def getfloat(self, section, option, *, raw=False, vars=None,
+                 fallback=_UNSET):
+        try:
+            return self._get(section, float, option, raw=raw, vars=vars)
+        except (NoSectionError, NoOptionError):
+            if fallback is _UNSET:
+                raise
+            else:
+                return fallback
+
+    def getboolean(self, section, option, *, raw=False, vars=None,
+                   fallback=_UNSET):
+        try:
+            return self._get(section, self._convert_to_boolean, option,
+                             raw=raw, vars=vars)
+        except (NoSectionError, NoOptionError):
+            if fallback is _UNSET:
+                raise
+            else:
+                return fallback
+
+    def items(self, section=_UNSET, raw=False, vars=None):
+        """Return a list of (name, value) tuples for each option in a section.
+
+        All % interpolations are expanded in the return values, based on the
+        defaults passed into the constructor, unless the optional argument
+        `raw' is true.  Additional substitutions may be provided using the
+        `vars' argument, which must be a dictionary whose contents overrides
+        any pre-existing defaults.
+
+        The section DEFAULT is special.
+        """
+        if section is _UNSET:
+            return super().items()
+        d = self._defaults.copy()
+        try:
+            d.update(self._sections[section])
+        except KeyError:
+            if section != self.default_section:
+                raise NoSectionError(section)
+        # Update with the entry specific variables
+        if vars:
+            for key, value in vars.items():
+                d[self.optionxform(key)] = value
+        value_getter = lambda option: self._interpolation.before_get(self,
+            section, option, d[option], d)
+        if raw:
+            value_getter = lambda option: d[option]
+        return [(option, value_getter(option)) for option in d.keys()]
+
+    def popitem(self):
+        """Remove a section from the parser and return it as
+        a (section_name, section_proxy) tuple. If no section is present, raise
+        KeyError.
+
+        The section DEFAULT is never returned because it cannot be removed.
+        """
+        for key in self.sections():
+            value = self[key]
+            del self[key]
+            return key, value
+        raise KeyError
+
+    def optionxform(self, optionstr):
+        return optionstr.lower()
+
+    def has_option(self, section, option):
+        """Check for the existence of a given option in a given section.
+        If the specified `section' is None or an empty string, DEFAULT is
+        assumed. If the specified `section' does not exist, returns False."""
+        if not section or section == self.default_section:
+            option = self.optionxform(option)
+            return option in self._defaults
+        elif section not in self._sections:
+            return False
+        else:
+            option = self.optionxform(option)
+            return (option in self._sections[section]
+                    or option in self._defaults)
+
+    def set(self, section, option, value=None):
+        """Set an option."""
+        if value:
+            value = self._interpolation.before_set(self, section, option,
+                                                   value)
+        if not section or section == self.default_section:
+            sectdict = self._defaults
+        else:
+            try:
+                sectdict = self._sections[section]
+            except KeyError:
+                raise NoSectionError(section)
+        sectdict[self.optionxform(option)] = value
+
+    def write(self, fp, space_around_delimiters=True):
+        """Write an .ini-format representation of the configuration state.
+
+        If `space_around_delimiters' is True (the default), delimiters
+        between keys and values are surrounded by spaces.
+        """
+        if space_around_delimiters:
+            d = " {} ".format(self._delimiters[0])
+        else:
+            d = self._delimiters[0]
+        if self._defaults:
+            self._write_section(fp, self.default_section,
+                                    self._defaults.items(), d)
+        for section in self._sections:
+            self._write_section(fp, section,
+                                self._sections[section].items(), d)
+
+    def _write_section(self, fp, section_name, section_items, delimiter):
+        """Write a single section to the specified `fp'."""
+        fp.write("[{}]\n".format(section_name))
+        for key, value in section_items:
+            value = self._interpolation.before_write(self, section_name, key,
+                                                     value)
+            if value is not None or not self._allow_no_value:
+                value = delimiter + str(value).replace('\n', '\n\t')
+            else:
+                value = ""
+            fp.write("{}{}\n".format(key, value))
+        fp.write("\n")
+
+    def remove_option(self, section, option):
+        """Remove an option."""
+        if not section or section == self.default_section:
+            sectdict = self._defaults
+        else:
+            try:
+                sectdict = self._sections[section]
+            except KeyError:
+                raise NoSectionError(section)
+        option = self.optionxform(option)
+        existed = option in sectdict
+        if existed:
+            del sectdict[option]
+        return existed
+
+    def remove_section(self, section):
+        """Remove a file section."""
+        existed = section in self._sections
+        if existed:
+            del self._sections[section]
+            del self._proxies[section]
+        return existed
+
+    def __getitem__(self, key):
+        if key != self.default_section and not self.has_section(key):
+            raise KeyError(key)
+        return self._proxies[key]
+
+    def __setitem__(self, key, value):
+        # To conform with the mapping protocol, overwrites existing values in
+        # the section.
+
+        # XXX this is not atomic if read_dict fails at any point. Then again,
+        # no update method in configparser is atomic in this implementation.
+        if key == self.default_section:
+            self._defaults.clear()
+        elif key in self._sections:
+            self._sections[key].clear()
+        self.read_dict({key: value})
+
+    def __delitem__(self, key):
+        if key == self.default_section:
+            raise ValueError("Cannot remove the default section.")
+        if not self.has_section(key):
+            raise KeyError(key)
+        self.remove_section(key)
+
+    def __contains__(self, key):
+        return key == self.default_section or self.has_section(key)
+
+    def __len__(self):
+        return len(self._sections) + 1 # the default section
+
+    def __iter__(self):
+        # XXX does it break when underlying container state changed?
+        return itertools.chain((self.default_section,), self._sections.keys())
+
+    def _read(self, fp, fpname):
+        """Parse a sectioned configuration file.
+
+        Each section in a configuration file contains a header, indicated by
+        a name in square brackets (`[]'), plus key/value options, indicated by
+        `name' and `value' delimited with a specific substring (`=' or `:' by
+        default).
+
+        Values can span multiple lines, as long as they are indented deeper
+        than the first line of the value. Depending on the parser's mode, blank
+        lines may be treated as parts of multiline values or ignored.
+
+        Configuration files may include comments, prefixed by specific
+        characters (`#' and `;' by default). Comments may appear on their own
+        in an otherwise empty line or may be entered in lines holding values or
+        section names.
+        """
+        elements_added = set()
+        cursect = None                        # None, or a dictionary
+        sectname = None
+        optname = None
+        lineno = 0
+        indent_level = 0
+        e = None                              # None, or an exception
+        for lineno, line in enumerate(fp, start=1):
+            comment_start = sys.maxsize
+            # strip inline comments
+            inline_prefixes = {p: -1 for p in self._inline_comment_prefixes}
+            while comment_start == sys.maxsize and inline_prefixes:
+                next_prefixes = {}
+                for prefix, index in inline_prefixes.items():
+                    index = line.find(prefix, index+1)
+                    if index == -1:
+                        continue
+                    next_prefixes[prefix] = index
+                    if index == 0 or (index > 0 and line[index-1].isspace()):
+                        comment_start = min(comment_start, index)
+                inline_prefixes = next_prefixes
+            # strip full line comments
+            for prefix in self._comment_prefixes:
+                if line.strip().startswith(prefix):
+                    comment_start = 0
+                    break
+            if comment_start == sys.maxsize:
+                comment_start = None
+            value = line[:comment_start].strip()
+            if not value:
+                if self._empty_lines_in_values:
+                    # add empty line to the value, but only if there was no
+                    # comment on the line
+                    if (comment_start is None and
+                        cursect is not None and
+                        optname and
+                        cursect[optname] is not None):
+                        cursect[optname].append('') # newlines added at join
+                else:
+                    # empty line marks end of value
+                    indent_level = sys.maxsize
+                continue
+            # continuation line?
+            first_nonspace = self.NONSPACECRE.search(line)
+            cur_indent_level = first_nonspace.start() if first_nonspace else 0
+            if (cursect is not None and optname and
+                cur_indent_level > indent_level):
+                cursect[optname].append(value)
+            # a section header or option header?
+            else:
+                indent_level = cur_indent_level
+                # is it a section header?
+                mo = self.SECTCRE.match(value)
+                if mo:
+                    sectname = mo.group('header')
+                    if sectname in self._sections:
+                        if self._strict and sectname in elements_added:
+                            raise DuplicateSectionError(sectname, fpname,
+                                                        lineno)
+                        cursect = self._sections[sectname]
+                        elements_added.add(sectname)
+                    elif sectname == self.default_section:
+                        cursect = self._defaults
+                    else:
+                        cursect = self._dict()
+                        self._sections[sectname] = cursect
+                        self._proxies[sectname] = SectionProxy(self, sectname)
+                        elements_added.add(sectname)
+                    # So sections can't start with a continuation line
+                    optname = None
+                # no section header in the file?
+                elif cursect is None:
+                    raise MissingSectionHeaderError(fpname, lineno, line)
+                # an option line?
+                else:
+                    mo = self._optcre.match(value)
+                    if mo:
+                        optname, vi, optval = mo.group('option', 'vi', 'value')
+                        if not optname:
+                            e = self._handle_error(e, fpname, lineno, line)
+                        optname = self.optionxform(optname.rstrip())
+                        if (self._strict and
+                            (sectname, optname) in elements_added):
+                            raise DuplicateOptionError(sectname, optname,
+                                                       fpname, lineno)
+                        elements_added.add((sectname, optname))
+                        # This check is fine because the OPTCRE cannot
+                        # match if it would set optval to None
+                        if optval is not None:
+                            optval = optval.strip()
+                            cursect[optname] = [optval]
+                        else:
+                            # valueless option handling
+                            cursect[optname] = None
+                    else:
+                        # a non-fatal parsing error occurred. set up the
+                        # exception but keep going. the exception will be
+                        # raised at the end of the file and will contain a
+                        # list of all bogus lines
+                        e = self._handle_error(e, fpname, lineno, line)
+        # if any parsing errors occurred, raise an exception
+        if e:
+            raise e
+        self._join_multiline_values()
+
+    def _join_multiline_values(self):
+        defaults = self.default_section, self._defaults
+        all_sections = itertools.chain((defaults,),
+                                       self._sections.items())
+        for section, options in all_sections:
+            for name, val in options.items():
+                if isinstance(val, list):
+                    val = '\n'.join(val).rstrip()
+                options[name] = self._interpolation.before_read(self,
+                                                                section,
+                                                                name, val)
+
+    def _handle_error(self, exc, fpname, lineno, line):
+        if not exc:
+            exc = ParsingError(fpname)
+        exc.append(lineno, repr(line))
+        return exc
+
+    def _unify_values(self, section, vars):
+        """Create a sequence of lookups with 'vars' taking priority over
+        the 'section' which takes priority over the DEFAULTSECT.
+
+        """
+        sectiondict = {}
+        try:
+            sectiondict = self._sections[section]
+        except KeyError:
+            if section != self.default_section:
+                raise NoSectionError(section)
+        # Update with the entry specific variables
+        vardict = {}
+        if vars:
+            for key, value in vars.items():
+                if value is not None:
+                    value = str(value)
+                vardict[self.optionxform(key)] = value
+        return _ChainMap(vardict, sectiondict, self._defaults)
+
+    def _convert_to_boolean(self, value):
+        """Return a boolean value translating from other types if necessary.
+        """
+        if value.lower() not in self.BOOLEAN_STATES:
+            raise ValueError('Not a boolean: %s' % value)
+        return self.BOOLEAN_STATES[value.lower()]
+
+    def _validate_value_types(self, *, section="", option="", value=""):
+        """Raises a TypeError for non-string values.
+
+        The only legal non-string value if we allow valueless
+        options is None, so we need to check if the value is a
+        string if:
+        - we do not allow valueless options, or
+        - we allow valueless options but the value is not None
+
+        For compatibility reasons this method is not used in classic set()
+        for RawConfigParsers. It is invoked in every case for mapping protocol
+        access and in ConfigParser.set().
+        """
+        if not isinstance(section, str):
+            raise TypeError("section names must be strings")
+        if not isinstance(option, str):
+            raise TypeError("option keys must be strings")
+        if not self._allow_no_value or value:
+            if not isinstance(value, str):
+                raise TypeError("option values must be strings")
 
 
-def get_config_var(name):
-    """Return the value of a single variable using the dictionary returned by
-    'get_config_vars()'.
+class ConfigParser(RawConfigParser):
+    """ConfigParser implementing interpolation."""
 
-    Equivalent to get_config_vars().get(name)
-    """
-    return get_config_vars().get(name)
+    _DEFAULT_INTERPOLATION = BasicInterpolation()
 
+    def set(self, section, option, value=None):
+        """Set an option.  Extends RawConfigParser.set by validating type and
+        interpolation syntax on the value."""
+        self._validate_value_types(option=option, value=value)
+        super().set(section, option, value)
 
-def get_platform():
-    """Return a string that identifies the current platform.
-
-    This is used mainly to distinguish platform-specific build directories and
-    platform-specific built distributions.  Typically includes the OS name
-    and version and the architecture (as supplied by 'os.uname()'),
-    although the exact information included depends on the OS; eg. for IRIX
-    the architecture isn't particularly important (IRIX only runs on SGI
-    hardware), but for Linux the kernel version isn't particularly
-    important.
-
-    Examples of returned values:
-       linux-i586
-       linux-alpha (?)
-       solaris-2.6-sun4u
-       irix-5.3
-       irix64-6.2
-
-    Windows will return one of:
-       win-amd64 (64bit Windows on AMD64 (aka x86_64, Intel64, EM64T, etc)
-       win-ia64 (64bit Windows on Itanium)
-       win32 (all others - specifically, sys.platform is returned)
-
-    For other non-POSIX platforms, currently just returns 'sys.platform'.
-    """
-    if os.name == 'nt':
-        # sniff sys.version for architecture.
-        prefix = " bit ("
-        i = sys.version.find(prefix)
-        if i == -1:
-            return sys.platform
-        j = sys.version.find(")", i)
-        look = sys.version[i+len(prefix):j].lower()
-        if look == 'amd64':
-            return 'win-amd64'
-        if look == 'itanium':
-            return 'win-ia64'
-        return sys.platform
-
-    if os.name != "posix" or not hasattr(os, 'uname'):
-        # XXX what about the architecture? NT is Intel or Alpha
-        return sys.platform
-
-    # Set for cross builds explicitly
-    if "_PYTHON_HOST_PLATFORM" in os.environ:
-        return os.environ["_PYTHON_HOST_PLATFORM"]
-
-    # Try to distinguish various flavours of Unix
-    osname, host, release, version, machine = os.uname()
-
-    # Convert the OS name to lowercase, remove '/' characters
-    # (to accommodate BSD/OS), and translate spaces (for "Power Macintosh")
-    osname = osname.lower().replace('/', '')
-    machine = machine.replace(' ', '_')
-    machine = machine.replace('/', '-')
-
-    if osname[:5] == "linux":
-        # At least on Linux/Intel, 'machine' is the processor --
-        # i386, etc.
-        # XXX what about Alpha, SPARC, etc?
-        return  "%s-%s" % (osname, machine)
-    elif osname[:5] == "sunos":
-        if release[0] >= "5":           # SunOS 5 == Solaris 2
-            osname = "solaris"
-            release = "%d.%s" % (int(release[0]) - 3, release[2:])
-            # We can't use "platform.architecture()[0]" because a
-            # bootstrap problem. We use a dict to get an error
-            # if some suspicious happens.
-            bitness = {2147483647:"32bit", 9223372036854775807:"64bit"}
-            machine += ".%s" % bitness[sys.maxsize]
-        # fall through to standard osname-release-machine representation
-    elif osname[:4] == "irix":              # could be "irix64"!
-        return "%s-%s" % (osname, release)
-    elif osname[:3] == "aix":
-        return "%s-%s.%s" % (osname, version, release)
-    elif osname[:6] == "cygwin":
-        osname = "cygwin"
-        rel_re = re.compile(r'[\d.]+')
-        m = rel_re.match(release)
-        if m:
-            release = m.group()
-    elif osname[:6] == "darwin":
-        import _osx_support
-        osname, release, machine = _osx_support.get_platform_osx(
-                                            get_config_vars(),
-                                            osname, release, machine)
-
-    return "%s-%s-%s" % (osname, release, machine)
+    def add_section(self, section):
+        """Create a new section in the configuration.  Extends
+        RawConfigParser.add_section by validating if the section name is
+        a string."""
+        self._validate_value_types(section=section)
+        super().add_section(section)
 
 
-def get_python_version():
-    return _PY_VERSION_SHORT
+class SafeConfigParser(ConfigParser):
+    """ConfigParser alias for backwards compatibility purposes."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(
+            "The SafeConfigParser class has been renamed to ConfigParser "
+            "in Python 3.2. This alias will be removed in future versions."
+            " Use ConfigParser directly instead.",
+            DeprecationWarning, stacklevel=2
+        )
 
 
-def _print_dict(title, data):
-    for index, (key, value) in enumerate(sorted(data.items())):
-        if index == 0:
-            print('%s: ' % (title))
-        print('\t%s = "%s"' % (key, value))
+class SectionProxy(MutableMapping):
+    """A proxy for a single section from a parser."""
 
+    def __init__(self, parser, name):
+        """Creates a view on a section of the specified `name` in `parser`."""
+        self._parser = parser
+        self._name = name
 
-def _main():
-    """Display all information sysconfig detains."""
-    if '--generate-posix-vars' in sys.argv:
-        _generate_posix_vars()
-        return
-    print('Platform: "%s"' % get_platform())
-    print('Python version: "%s"' % get_python_version())
-    print('Current installation scheme: "%s"' % _get_default_scheme())
-    print()
-    _print_dict('Paths', get_paths())
-    print()
-    _print_dict('Variables', get_config_vars())
-if __name__ == '__main__':
-    pass
+    def __repr__(self):
+        return '<Section: {}>'.format(self._name)
+
+    def __getitem__(self, key):
+        if not self._parser.has_option(self._name, key):
+            raise KeyError(key)
+        return self._parser.get(self._name, key)
+
+    def __setitem__(self, key, value):
+        self._parser._validate_value_types(option=key, value=value)
+        return self._parser.set(self._name, key, value)
+
+    def __delitem__(self, key):
+        if not (self._parser.has_option(self._name, key) and
+                self._parser.remove_option(self._name, key)):
+            raise KeyError(key)
+
+    def __contains__(self, key):
+        return self._parser.has_option(self._name, key)
+
+    def __len__(self):
+        return len(self._options())
+
+    def __iter__(self):
+        return self._options().__iter__()
+
+    def _options(self):
+        if self._name != self._parser.default_section:
+            return self._parser.options(self._name)
+        else:
+            return self._parser.defaults()
+
+    def get(self, option, fallback=None, *, raw=False, vars=None):
+        return self._parser.get(self._name, option, raw=raw, vars=vars,
+                                fallback=fallback)
+
+    def getint(self, option, fallback=None, *, raw=False, vars=None):
+        return self._parser.getint(self._name, option, raw=raw, vars=vars,
+                                   fallback=fallback)
+
+    def getfloat(self, option, fallback=None, *, raw=False, vars=None):
+        return self._parser.getfloat(self._name, option, raw=raw, vars=vars,
+                                     fallback=fallback)
+
+    def getboolean(self, option, fallback=None, *, raw=False, vars=None):
+        return self._parser.getboolean(self._name, option, raw=raw, vars=vars,
+                                       fallback=fallback)
+
+    @property
+    def parser(self):
+        # The parser object of the proxy is read-only.
+        return self._parser
+
+    @property
+    def name(self):
+        # The name of the section on a proxy is read-only.
+        return self._name
