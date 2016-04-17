@@ -12,6 +12,7 @@ number. Note that there could be repeats in the list. So if you
 gave an input of 20, the output would be [2, 2, 5].
 
 """
+# Difficulty: how to divide the factor to prime factors 
 def isprime(int_num):
     result = True
     if int_num <=0 or not isinstance(int_num,int):
@@ -46,5 +47,5 @@ def factorization(int_num):
                 continue
         print(prime_factors)
 
-factorization(100)
+factorization(100) 
         
