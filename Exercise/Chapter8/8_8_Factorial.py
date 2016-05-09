@@ -9,7 +9,7 @@ is N! where N! == factorial(N) == 1 * 2 * 3 * . . . * (N-2) *
 given N, the value N! is returned.
 """
 def factorial(int_num):
-    if int_num == 1 :
+    if int_num <= 1 :
         return 1
     else :
         return factorial(int_num) * factorial(int_num -1)
